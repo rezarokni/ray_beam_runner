@@ -47,12 +47,14 @@ from ray_beam_runner.stream_processor import utils
 from ray_beam_runner.stream_processor.serialization import \
   register_protobuf_serializers
 from ray_beam_runner.stream_processor.sdk_proccess import SDKActor
-from ray_beam_runner.stream_processor.sdk_proccess import process_bundles
+# from ray_beam_runner.stream_processor.sdk_proccess import process_bundles
 from ray_beam_runner.stream_processor.stage_actor import StageActor
 from ray_beam_runner.stream_processor.state import RayStateManager
-from ray_beam_runner.stream_processor.temporary_refactor import \
+from ray_beam_runner.stream_processor.state import \
+  PcollectionBufferManager
+from ray_beam_runner.stream_processor.ray_pipeline_context import \
   RayPipelineContext
-from ray_beam_runner.stream_processor.temporary_refactor import \
+from ray_beam_runner.stream_processor.ray_pipeline_context import \
   RayWorkerHandlerManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -199,50 +201,37 @@ class RayFnApiRunner(runner.PipelineRunner):
   ) -> "RayRunnerResult":
     """Execute pipeline represented by a list of stages and a context."""
     logging.info("Starting pipeline of %d stages." % len(stages))
+
     dag = utils.assemble_dag(stages)
 
     register_protobuf_serializers()
 
     # TODO remove temp extraction of global info
-    temp_system_context = RayPipelineContext(stages=stages,
+    pipeline_context = RayPipelineContext(stages=stages,
                                              pipeline_components=stage_context.components,
                                              safe_coders=stage_context.safe_coders,
                                              data_channel_coders=stage_context.data_channel_coders)
-
-    # Using this queue to hold 'bundles' that are ready to be processed
-    queue = collections.deque()
 
     # stage metrics
     monitoring_infos_by_stage: MutableMapping[
       str, Iterable["metrics_pb2.MonitoringInfo"]
     ] = {}
 
-    # Global State manager, TODO Change to channels
-    state_servicer = RayStateManager()
-
-    # Work manager
-    worker_manager = RayWorkerHandlerManager()
-
     try:
-      for stage in stages:
-        runner_execution_context = StageActor(
-            stage,
-            queue,
-            state_servicer=state_servicer,
-            worker_manager=worker_manager,
-            temp_system_context=temp_system_context
-        )
-        bundle_ctx = SDKActor(runner_execution_context, stage)
-        result = process_bundles(
-          runner_execution_context=runner_execution_context,
-          worker_manager=runner_execution_context.worker_manager,
-          pcollection_buffers=runner_execution_context.pcollection_buffers,
-          bundle_context_manager=bundle_ctx,
-          ready_bundles=queue)
-        monitoring_infos_by_stage[
-          bundle_ctx.stage.name
-        ] = result.process_bundle.monitoring_infos
 
+      for stage in stages:
+        stage_actor = StageActor(
+            stage,
+            pipeline_context=pipeline_context
+        )
+        result = stage_actor.sdk_process.process_bundles(
+            pipeline_context=pipeline_context,
+            worker_manager=pipeline_context.worker_manager,
+            pcollection_buffers=pipeline_context.pcollection_buffers)
+
+        monitoring_infos_by_stage[
+          stage_actor.sdk_process.stage.name
+        ] = result.process_bundle.monitoring_infos
     finally:
       pass
     return RayRunnerResult(runner.PipelineState.DONE, monitoring_infos_by_stage)

@@ -1,19 +1,22 @@
-import collections
 import itertools
+import random
 from typing import List, Mapping
-
 import ray
+
 from apache_beam.metrics import monitoring_infos
 from apache_beam.portability.api import beam_fn_api_pb2
 from apache_beam.portability.api import beam_runner_api_pb2
 from apache_beam.runners import pipeline_context
+
+from ray_beam_runner.stream_processor.state import RayStateManager
+from ray_beam_runner.stream_processor.state import \
+    PcollectionBufferManager
 
 
 from apache_beam.runners.portability.fn_api_runner import \
   execution as fn_execution
 
 from apache_beam.runners.portability.fn_api_runner import translations
-
 
 class RayStage(translations.Stage):
     @staticmethod
@@ -42,22 +45,10 @@ class RayWorkerHandlerManager:
     def process_bundle_descriptor(self, id):
         return self._process_bundle_descriptors[id]
 
-class PcollectionBufferManager:
-    def __init__(self):
-        self.buffers = collections.defaultdict(list)
-
-    def put(self, pcoll, data_refs: List[ray.ObjectRef]):
-        self.buffers[pcoll].extend(data_refs)
-
-    def get(self, pcoll) -> List[ray.ObjectRef]:
-        return self.buffers[pcoll]
-
-    def clear(self, pcoll):
-        self.buffers[pcoll].clear()
 
 
 class RayPipelineContext(object):
-    """ Temporaray Refectoring utilty to move out later """
+    """ Store all information and references that span across whole pipeline"""
 
     def __init__(
         self,
@@ -67,6 +58,17 @@ class RayPipelineContext(object):
         data_channel_coders: Mapping[str, str],
 
     ):
+
+        # Global State manager, TODO Change to channels
+        self.state_servicer = RayStateManager()
+
+        # Work manager
+        self.worker_manager = RayWorkerHandlerManager()
+
+        self.pcollection_buffers = PcollectionBufferManager()
+
+        self.encoded_impulse_ref = ray.put([fn_execution.ENCODED_IMPULSE_VALUE])
+
         self.stages = [
             RayStage.from_Stage(s) if not isinstance(s, RayStage) else s for
             s in stages
@@ -88,7 +90,14 @@ class RayPipelineContext(object):
             # id: self._make_safe_windowing_strategy(id)
             id: id
             for id in pipeline_components.windowing_strategies.keys()
-}
+        }
+
+    def next_uid(self):
+        # TODO(pabloem): Use stats actor for UIDs.
+        # return str(ray.get(self.stats.next_bundle.remote()))
+        # self._uid += 1
+        return str(random.randint(0, 11111111))
+
 
 def merge_stage_results(
     previous_result: beam_fn_api_pb2.InstructionResponse,

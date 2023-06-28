@@ -11,7 +11,6 @@ from ray import ObjectRef
 from typing import Optional,Tuple, Iterator, TypeVar
 from apache_beam.portability.api import beam_fn_api_pb2
 from apache_beam.runners.worker import sdk_worker
-from apache_beam.runners.portability.fn_api_runner import translations
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,3 +121,16 @@ class RayStateManager(sdk_worker.StateHandler):
   def done(self):
     pass
 
+
+class PcollectionBufferManager:
+    def __init__(self):
+        self.buffers = collections.defaultdict(list)
+
+    def put(self, pcoll, data_refs: List[ray.ObjectRef]):
+        self.buffers[pcoll].extend(data_refs)
+
+    def get(self, pcoll) -> List[ray.ObjectRef]:
+        return self.buffers[pcoll]
+
+    def clear(self, pcoll):
+        self.buffers[pcoll].clear()

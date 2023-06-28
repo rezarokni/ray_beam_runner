@@ -11,6 +11,7 @@ from typing import Tuple
 from typing import Union
 from typing import Generator
 
+import dataclasses
 import apache_beam
 from apache_beam import coders
 
@@ -39,21 +40,42 @@ from apache_beam.portability import common_urns
 
 from ray_beam_runner.stream_processor.serialization import \
   register_protobuf_serializers
-from ray_beam_runner.stream_processor.stage_actor import Bundle
-from ray_beam_runner.stream_processor.stage_actor import StageActor
-from ray_beam_runner.stream_processor.stage_actor import _get_input_id
+
 from ray_beam_runner.stream_processor.state import RayStateManager
-from ray_beam_runner.stream_processor.temporary_refactor import \
+from ray_beam_runner.stream_processor.state import \
   PcollectionBufferManager
-from ray_beam_runner.stream_processor.temporary_refactor import \
+from ray_beam_runner.stream_processor.ray_pipeline_context import \
   RayPipelineContext
-from ray_beam_runner.stream_processor.temporary_refactor import \
+from ray_beam_runner.stream_processor.ray_pipeline_context import \
   RayWorkerHandlerManager
 
-from ray_beam_runner.stream_processor.temporary_refactor import \
+from ray_beam_runner.stream_processor.ray_pipeline_context import \
   merge_stage_results
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class Bundle:
+    input_timers: Mapping[
+        translations.TimerFamilyId, fn_execution.PartitionableBuffer]
+    input_data: Mapping[str, List[ray.ObjectRef]]
+
+def _get_input_id(buffer_id, transform_name):
+    """Get the 'buffer_id' for the input data we're retrieving.
+
+    For most data, the buffer ID is as expected, but for IMPULSE readers, the
+    buffer ID is the consumer name.
+    """
+    if isinstance(buffer_id, bytes) and (
+            buffer_id.startswith(b"materialize")
+            or buffer_id.startswith(b"timer")
+            or buffer_id.startswith(b"group")
+    ):
+        buffer_id = buffer_id
+    else:
+        buffer_id = transform_name.encode("ascii")
+    return buffer_id
 
 
 def _get_source_transform_name(
@@ -130,7 +152,7 @@ def _retrieve_delayed_applications(
 
 
 def _fetch_decode_data(
-    runner_context: RayPipelineContext,
+    ray_pipeline_context: RayPipelineContext,
     buffer_id: bytes,
     coder_id: str,
     data_references: List[ray.ObjectRef],
@@ -139,16 +161,16 @@ def _fetch_decode_data(
   if buffer_id.startswith(b"group"):
     _, pcoll_id = translations.split_buffer_id(buffer_id)
     transform = \
-    runner_context.pipeline_components.transforms[pcoll_id]
+    ray_pipeline_context.pipeline_components.transforms[pcoll_id]
     out_pcoll = \
-    runner_context.pipeline_components.pcollections[
+    ray_pipeline_context.pipeline_components.pcollections[
       translations.only_element(transform.outputs.values())
     ]
     windowing_strategy = \
-      runner_context.pipeline_components.windowing_strategies[
+      ray_pipeline_context.pipeline_components.windowing_strategies[
         out_pcoll.windowing_strategy_id
       ]
-    postcoder = runner_context.pipeline_context.coders[
+    postcoder = ray_pipeline_context.pipeline_context.coders[
       coder_id]
     precoder = coders.WindowedValueCoder(
         coders.TupleCoder(
@@ -167,7 +189,7 @@ def _fetch_decode_data(
     )
   else:
     buffer = fn_execution.ListBuffer(
-        coder_impl=runner_context.pipeline_context.coders[
+        coder_impl=ray_pipeline_context.pipeline_context.coders[
           coder_id].get_impl()
     )
 
@@ -216,12 +238,14 @@ def _get_worker_handler(
 
 @ray.remote(num_returns="dynamic")
 def ray_execute_bundle(
-    runner_context: "StageActor",
     input_bundle: "Bundle",
     transform_buffer_coder: Mapping[str, typing.Tuple[bytes, str]],
     expected_outputs: translations.DataOutput,
     stage_timers: Mapping[translations.TimerFamilyId, bytes],
     instruction_request_repr: Mapping[str, typing.Any],
+    state_servicer : RayStateManager,
+    worker_manager : RayWorkerHandlerManager,
+    pipeline_context : RayPipelineContext,
     dry_run=False,
 ) -> Generator:
   # generator returns:
@@ -245,7 +269,7 @@ def ray_execute_bundle(
   process_bundle_id = instruction_request.instruction_id
 
   worker_handler = _get_worker_handler(
-      runner_context.state_servicer, runner_context.worker_manager,
+      state_servicer, worker_manager,
       instruction_request_repr["process_descriptor_id"]
   )
 
@@ -253,7 +277,7 @@ def ray_execute_bundle(
 
   input_data = {
       k: _fetch_decode_data(
-          runner_context.temp_system_context,
+          pipeline_context,
           _get_input_id(transform_buffer_coder[k][0], k),
           transform_buffer_coder[k][1],
           objrefs,
@@ -314,7 +338,7 @@ def ray_execute_bundle(
   # - timers
   # - SDK-initiated deferred applications of root elements
   # - # TODO: Runner-initiated deferred applications of root elements
-  process_bundle_descriptor = runner_context.worker_manager.process_bundle_descriptor(
+  process_bundle_descriptor = worker_manager.process_bundle_descriptor(
       instruction_request_repr["process_descriptor_id"]
   )
   delayed_applications = _retrieve_delayed_applications(
@@ -334,7 +358,7 @@ def ray_execute_bundle(
 class SDKActor:
   def __init__(
       self,
-      execution_context: StageActor,
+      execution_context: RayPipelineContext,
       stage: translations.Stage,
   ) -> None:
     self.execution_context = execution_context
@@ -400,15 +424,15 @@ class SDKActor:
             self.stage.transforms
         },
         pcollections=dict(
-            self.execution_context.temp_system_context.pipeline_components.pcollections.items()
+            self.execution_context.pipeline_components.pcollections.items()
         ),
         coders=dict(
-          self.execution_context.temp_system_context.pipeline_components.coders.items()),
+          self.execution_context.pipeline_components.coders.items()),
         windowing_strategies=dict(
-            self.execution_context.temp_system_context.pipeline_components.windowing_strategies.items()
+            self.execution_context.pipeline_components.windowing_strategies.items()
         ),
         environments=dict(
-            self.execution_context.temp_system_context.pipeline_components.environments.items()
+            self.execution_context.pipeline_components.environments.items()
         ),
         state_api_service_descriptor=self.state_api_service_descriptor(),
         timer_api_service_descriptor=self.data_api_service_descriptor(),
@@ -446,7 +470,7 @@ class SDKActor:
         pcoll_id = transform.spec.payload
         if transform.spec.urn == bundle_processor.DATA_INPUT_URN:
           coder_id = \
-          self.execution_context.temp_system_context.data_channel_coders[
+          self.execution_context.data_channel_coders[
             translations.only_element(transform.outputs.values())
           ]
           if pcoll_id == translations.IMPULSE_BUFFER:
@@ -458,13 +482,13 @@ class SDKActor:
             pass
           transform_to_buffer_coder[transform.unique_name] = (
               pcoll_id,
-              self.execution_context.temp_system_context.safe_coders.get(
+              self.execution_context.safe_coders.get(
                 coder_id, coder_id),
           )
         elif transform.spec.urn == bundle_processor.DATA_OUTPUT_URN:
           data_output[transform.unique_name] = pcoll_id
           coder_id = \
-          self.execution_context.temp_system_context.data_channel_coders[
+          self.execution_context.data_channel_coders[
             translations.only_element(transform.inputs.values())
           ]
         else:
@@ -485,82 +509,138 @@ class SDKActor:
         expected_timer_output,
     )
 
+  def commit_side_inputs_to_state(self,
+                                  data_side_input: translations.DataSideInput):
+      """
+      Store side inputs in the state manager so that they can be accessed by workers.
+      """
+      for (consuming_transform_id, tag), (
+              buffer_id,
+              func_spec,
+      ) in data_side_input.items():
+          _, pcoll_id = translations.split_buffer_id(buffer_id)
+          value_coder = self.pipeline_context.pipeline_context.coders[
+              self.pipeline_context.safe_coders[self.pipeline_context.data_channel_coders[pcoll_id]]
+          ]
 
-def process_bundles(
-    runner_execution_context: StageActor,
-    worker_manager: RayWorkerHandlerManager,
-    pcollection_buffers: PcollectionBufferManager,
-    bundle_context_manager: SDKActor,
-    ready_bundles: collections.deque,
-) -> beam_fn_api_pb2.InstructionResponse:
-  """Run an individual stage.
+          elements_by_window = fn_execution.WindowGroupingBuffer(
+              func_spec, value_coder
+          )
 
-  Args:
-    runner_execution_context: An object containing execution information for
-      the pipeline.
-    bundle_context_manager (execution.BundleContextManager): A description of
-      the stage to execute, and its context.
-  """
-  bundle_context_manager.setup()
-  worker_manager.register_process_bundle_descriptor(
-      bundle_context_manager.process_bundle_descriptor
-  )
-  input_timers: Mapping[
-    translations.TimerFamilyId, execution.PartitionableBuffer
-  ] = {}
+          # TODO: Fix this
+          pcoll_buffer = ray.get(self.pipeline_context.pcollection_buffers.get(buffer_id))
+          for bundle_items in pcoll_buffer:
+              for bundle_item in bundle_items:
+                  elements_by_window.append(bundle_item)
 
-  input_data = {
-      k: pcollection_buffers.get(
-          _get_input_id(bundle_context_manager.transform_to_buffer_coder[k][0],
-                        k)
+          futures = []
+          if func_spec.urn == common_urns.side_inputs.ITERABLE.urn:
+              for _, window, elements_data in elements_by_window.encoded_items():
+                  state_key = beam_fn_api_pb2.StateKey(
+                      iterable_side_input=beam_fn_api_pb2.StateKey.IterableSideInput(
+                          transform_id=consuming_transform_id,
+                          side_input_id=tag,
+                          window=window,
+                      )
+                  )
+                  futures.append(
+                      self.state_servicer.append_raw(
+                          state_key, elements_data
+                      )._object_ref
+                  )
+          elif func_spec.urn == common_urns.side_inputs.MULTIMAP.urn:
+              for key, window, elements_data in elements_by_window.encoded_items():
+                  state_key = beam_fn_api_pb2.StateKey(
+                      multimap_side_input=beam_fn_api_pb2.StateKey.MultimapSideInput(
+                          transform_id=consuming_transform_id,
+                          side_input_id=tag,
+                          window=window,
+                          key=key,
+                      )
+                  )
+                  futures.append(
+                      self.state_servicer.append_raw(
+                          state_key, elements_data
+                      )._object_ref
+                  )
+          else:
+              raise ValueError("Unknown access pattern: '%s'" % func_spec.urn)
+
+          ray.wait(futures, num_returns=len(futures))
+
+  def process_bundles(self,
+                      pipeline_context: RayPipelineContext,
+                      worker_manager: RayWorkerHandlerManager,
+                      pcollection_buffers: PcollectionBufferManager
+                      ) -> beam_fn_api_pb2.InstructionResponse:
+      """Run an individual stage.
+
+      Args:
+        pipeline_context: An object containing execution information for
+          the pipeline.
+        bundle_context_manager (execution.BundleContextManager): A description of
+          the stage to execute, and its context.
+      """
+      self.setup()
+      worker_manager.register_process_bundle_descriptor(
+          self.process_bundle_descriptor
       )
-      for k in bundle_context_manager.transform_to_buffer_coder
-  }
+      input_timers: Mapping[
+        translations.TimerFamilyId, execution.PartitionableBuffer
+      ] = {}
 
-  final_result = None  # type: Optional[beam_fn_api_pb2.InstructionResponse]
+      input_data = {
+          k: pcollection_buffers.get(
+              _get_input_id(self.transform_to_buffer_coder[k][0],
+                            k)
+          )
+          for k in self.transform_to_buffer_coder
+      }
 
-  while True:
-    (
-        last_result,
-        fired_timers,
-        delayed_applications,
-        bundle_outputs,
-    ) = _run_bundle(
-        runner_execution_context,
-        bundle_context_manager,
-        Bundle(input_timers=input_timers, input_data=input_data),
-    )
+      final_result = None  # type: Optional[beam_fn_api_pb2.InstructionResponse]
 
-    final_result = merge_stage_results(final_result, last_result)
-    if not delayed_applications and not fired_timers:
-      break
-    else:
-      # TODO: Enable following assertion after watermarking is implemented
-      # assert (ray.get(
-      # runner_execution_context.watermark_manager
-      # .get_stage_node.remote(
-      #     bundle_context_manager.stage.name)).output_watermark()
-      #         < timestamp.MAX_TIMESTAMP), (
-      #     'wrong timestamp for %s. '
-      #     % ray.get(
-      #     runner_execution_context.watermark_manager
-      #     .get_stage_node.remote(
-      #     bundle_context_manager.stage.name)))
-      input_data = delayed_applications
-      input_timers = fired_timers
+      while True:
+        (
+            last_result,
+            fired_timers,
+            delayed_applications,
+            bundle_outputs,
+        ) = _run_bundle(
+            pipeline_context,
+            self,
+            Bundle(input_timers=input_timers, input_data=input_data),
+        )
 
-  # Store the required downstream side inputs into state so it is accessible
-  # for the worker when it runs bundles that consume this stage's output.
-  data_side_input = runner_execution_context.temp_system_context.side_input_descriptors_by_stage.get(
-      bundle_context_manager.stage.name, {}
-  )
-  runner_execution_context.commit_side_inputs_to_state(data_side_input)
+        final_result = merge_stage_results(final_result, last_result)
+        if not delayed_applications and not fired_timers:
+          break
+        else:
+          # TODO: Enable following assertion after watermarking is implemented
+          # assert (ray.get(
+          # runner_execution_context.watermark_manager
+          # .get_stage_node.remote(
+          #     bundle_context_manager.stage.name)).output_watermark()
+          #         < timestamp.MAX_TIMESTAMP), (
+          #     'wrong timestamp for %s. '
+          #     % ray.get(
+          #     runner_execution_context.watermark_manager
+          #     .get_stage_node.remote(
+          #     bundle_context_manager.stage.name)))
+          input_data = delayed_applications
+          input_timers = fired_timers
 
-  return final_result
+      # Store the required downstream side inputs into state so it is accessible
+      # for the worker when it runs bundles that consume this stage's output.
+      data_side_input = pipeline_context.side_input_descriptors_by_stage.get(
+          self.stage.name, {}
+      )
+      self.commit_side_inputs_to_state(data_side_input)
+
+      return final_result
 
 
 def _run_bundle(
-    runner_execution_context: StageActor,
+    runner_execution_context: RayPipelineContext,
     bundle_context_manager: SDKActor,
     input_bundle: Bundle,
 ) -> Tuple[
@@ -587,7 +667,6 @@ def _run_bundle(
 
   pbd_id = process_bundle_descriptor.id
   result_generator_ref = ray_execute_bundle.remote(
-      runner_execution_context,
       input_bundle,
       transform_to_buffer_coder,
       data_output,
@@ -597,6 +676,9 @@ def _run_bundle(
           "process_descriptor_id": pbd_id,
           "cache_token": next(cache_token_generator),
       },
+      state_servicer = runner_execution_context.state_servicer,
+      worker_manager = runner_execution_context.worker_manager,
+      pipeline_context= runner_execution_context
   )
   result_generator = iter(ray.get(result_generator_ref))
   result = ray.get(next(result_generator))
@@ -670,7 +752,7 @@ def _collect_written_timers(
       (transform_id, timer_family_id)
     ]
 
-    coder = execution_context.temp_system_context.pipeline_context.coders[
+    coder = execution_context.pipeline_context.temp_system_context.pipeline_context.coders[
       coder_id]
     timer_coder_impl = coder.get_impl()
 
