@@ -43,6 +43,7 @@ from apache_beam.metrics.execution import MetricResult
 from apache_beam.runners.portability import portable_metrics
 from apache_beam.portability.api import metrics_pb2
 
+from ray_beam_runner.stream_processor import utils
 from ray_beam_runner.stream_processor.serialization import \
   register_protobuf_serializers
 from ray_beam_runner.stream_processor.sdk_proccess import SDKActor
@@ -198,6 +199,7 @@ class RayFnApiRunner(runner.PipelineRunner):
   ) -> "RayRunnerResult":
     """Execute pipeline represented by a list of stages and a context."""
     logging.info("Starting pipeline of %d stages." % len(stages))
+    dag = utils.assemble_dag(stages)
 
     register_protobuf_serializers()
 
