@@ -637,7 +637,6 @@ def _run_bundle(
   return result, newly_set_timers, delayed_applications, output
 
 
-@staticmethod
 def _collect_written_timers(
     bundle_context_manager: SDKActor,
 ) -> Tuple[

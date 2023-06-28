@@ -1279,7 +1279,7 @@ class RayRunnerMetricsTest(unittest.TestCase):
 
   def create_pipeline(self):
     return beam.Pipeline(
-        runner=ray_beam_runner.portability.ray_fn_runner.RayFnApiRunner()
+        runner=ray_beam_runner.stream_processor.ray_fn_runner.RayFnApiRunner()
     )
 
   def test_element_count_metrics(self):
@@ -1626,7 +1626,7 @@ class RayRunnerSplitTest(unittest.TestCase):
 
   def create_pipeline(self, is_drain=False):
     return beam.Pipeline(
-        runner=ray_beam_runner.portability.ray_fn_runner.RayFnApiRunner()
+        runner=ray_beam_runner.stream_processor.ray_fn_runner.RayFnApiRunner()
     )
 
   def test_checkpoint(self):
